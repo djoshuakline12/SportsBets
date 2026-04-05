@@ -4,7 +4,7 @@ Runs on a configurable interval to:
 1. Refresh odds data
 2. Update Elo ratings from recent results
 3. Generate predictions
-4. Place limit orders on Kalshi for positive EV opportunities
+4. Place limit orders on Kalshi for the best +EV opportunities
 5. Settle completed bets and update bankroll
 """
 
@@ -20,6 +20,9 @@ from models.schemas import BankrollEntry, Bet, BetStatus, UserSettings
 from services import kalshi_service, odds_service, stats_service
 
 logger = logging.getLogger(__name__)
+
+# Max bets per cycle to avoid overexposure
+MAX_BETS_PER_CYCLE = 3
 
 
 async def run_betting_cycle():
@@ -43,19 +46,37 @@ async def run_betting_cycle():
         predictions = generate_predictions(db)
         logger.info(f"Generated {len(predictions)} predictions")
 
-        # 4. Filter for bettable predictions
+        # 4. Filter for bettable predictions and sort by confidence
         min_ev = settings.min_ev_threshold
         bettable = [p for p in predictions if p["expected_value"] >= min_ev and p["stake"] > 0]
+        bettable.sort(key=lambda p: p["confidence"], reverse=True)
         logger.info(f"Found {len(bettable)} bettable predictions (EV >= {min_ev})")
 
-        # 5. Place bets
+        # 5. Place bets — only the top N, and stop if bankroll runs out
+        bets_placed = 0
         for pred in bettable:
-            await _place_bet(db, pred)
+            if bets_placed >= MAX_BETS_PER_CYCLE:
+                logger.info(f"Hit max bets per cycle ({MAX_BETS_PER_CYCLE}), stopping")
+                break
+
+            # Check remaining Kalshi balance before each bet
+            try:
+                balance = await kalshi_service.get_account_balance()
+                available = balance.get("available", 0)
+                if available < 0.10:
+                    logger.info(f"Kalshi balance too low (${available:.2f}), stopping")
+                    break
+            except Exception:
+                pass
+
+            placed = await _place_bet(db, pred)
+            if placed:
+                bets_placed += 1
 
         # 6. Settle completed bets
         await _settle_bets(db)
 
-        logger.info("=== Betting cycle complete ===")
+        logger.info(f"=== Betting cycle complete: {bets_placed} bets placed ===")
 
     except Exception as e:
         logger.error(f"Betting cycle error: {e}", exc_info=True)
@@ -95,17 +116,16 @@ async def _update_elo_ratings(db: Session):
             logger.error(f"Elo update failed for {sport}: {e}")
 
 
-async def _place_bet(db: Session, prediction: dict):
-    """Place a limit order on Kalshi.
+async def _place_bet(db: Session, prediction: dict) -> bool:
+    """Place a limit order on Kalshi. Returns True if order was placed.
 
     On Kalshi, each team has its own ticker. We buy "yes" on the team
     we think will win, at a price equal to our estimated probability.
-    This posts a limit order — if nobody takes the other side, it sits
-    on the book until the market closes or someone fills it.
     """
     event_id = prediction["event_id"]
     side = prediction["recommended_side"]  # "home" or "away"
     stake = prediction["stake"]
+    bet_team = prediction["home_team"] if side == "home" else prediction["away_team"]
 
     # Check if we already have an active bet on this event
     existing = (
@@ -115,10 +135,9 @@ async def _place_bet(db: Session, prediction: dict):
     )
     if existing:
         logger.info(f"Already have pending bet on {event_id}, skipping")
-        return
+        return False
 
-    # Find ALL Kalshi markets for this game (one per team)
-    commence = datetime.fromisoformat(prediction["commence_time"])
+    # Find ALL Kalshi markets for this game
     markets = await kalshi_service.search_sports_markets(
         prediction["sport"],
         prediction["home_team"],
@@ -127,58 +146,66 @@ async def _place_bet(db: Session, prediction: dict):
 
     if not markets:
         logger.info(f"No Kalshi market found for {event_id}")
-        return
+        return False
 
-    # Find the right ticker for the team we're betting on
-    # Kalshi tickers end with team abbreviation (e.g., -OKC, -UTA)
-    bet_team = prediction["home_team"] if side == "home" else prediction["away_team"]
+    # Find the ticker specifically for our team
+    # Kalshi tickers end with team abbreviation (e.g., -SAC, -UTA, -OKC)
     target_market = None
+    bet_team_lower = bet_team.lower()
 
     for m in markets:
+        ticker = m.get("ticker", "")
         title = (m.get("title") or "").lower()
-        ticker = (m.get("ticker") or "").lower()
-        # Each team gets its own ticker — find the one for our team
-        if kalshi_service._fuzzy_match(bet_team.lower(), f"{title} {ticker}"):
+
+        # Check if the ticker's last segment matches our team
+        # e.g., KXNBAGAME-26APR05LACSAC-SAC -> last part is SAC
+        ticker_team = ticker.split("-")[-1].lower() if "-" in ticker else ""
+
+        # Match by: ticker suffix contains team city/name abbreviation,
+        # OR title contains our team name
+        if bet_team_lower in title or _team_matches_ticker(bet_team, ticker_team):
             target_market = m
             break
 
     if not target_market:
-        # Fallback: use first market and buy "yes"
-        target_market = markets[0]
-        logger.info(f"Using first market as fallback: {target_market['ticker']}")
+        logger.info(f"No exact Kalshi ticker match for {bet_team}, skipping")
+        return False
 
-    # Set limit price based on our model's probability
-    # We buy "yes" at a price that gives us +EV
-    # Our probability for this team winning = prediction's win_probability
+    # Set limit price: our model's probability minus a small edge
     win_prob = prediction["win_probability"]
-    # Post at slightly below our estimated probability for better value
     price_cents = max(1, min(99, int(win_prob * 100) - 2))
 
-    # Always buy "yes" on the team's specific ticker
-    kalshi_side = "yes"
+    # Ensure stake doesn't exceed what we can afford
+    cost = stake
+    if cost < 0.05:
+        logger.info(f"Stake too small (${cost:.2f}), skipping")
+        return False
 
-    # Place limit order
+    # Place limit order — buy "yes" on our team's ticker
     result = await kalshi_service.place_bet(
         ticker=target_market["ticker"],
-        side=kalshi_side,
+        side="yes",
         stake_dollars=stake,
         price_cents=price_cents,
     )
 
-    # Build analysis string for why we placed this bet
+    if not result.get("success"):
+        logger.warning(f"Kalshi order failed for {bet_team}: {result.get('error')}")
+        return False
+
+    # Build analysis
     factors = prediction.get("factors", {})
     analysis = (
         f"Model edge: {prediction['expected_value']:.1%} EV | "
         f"Elo: {factors.get('home_elo', 1500):.0f} vs {factors.get('away_elo', 1500):.0f} | "
-        f"Model prob: {win_prob:.1%} | "
-        f"Market consensus: {factors.get('market_home_prob', 0.5):.1%} | "
-        f"Blended: {factors.get('blended_home_prob', 0.5):.1%} | "
-        f"Books: {factors.get('num_bookmakers', 0)} | "
-        f"Kalshi ticker: {target_market['ticker']} | "
-        f"Limit price: ${price_cents}¢"
+        f"Win prob: {win_prob:.1%} | "
+        f"Market consensus: {factors.get('market_home_prob', 0.5):.1%} home | "
+        f"Blended: {factors.get('blended_home_prob', 0.5):.1%} home | "
+        f"Data from {factors.get('num_bookmakers', 0)} books | "
+        f"Kalshi: {target_market['ticker']} @ {price_cents}¢"
     )
 
-    # Record bet in database
+    # Record bet
     bet = Bet(
         prediction_id=prediction.get("prediction_id"),
         event_id=event_id,
@@ -187,35 +214,95 @@ async def _place_bet(db: Session, prediction: dict):
         away_team=prediction["away_team"],
         side=side,
         stake=stake,
-        odds=prediction["best_odds"],
+        odds=100 / price_cents if price_cents > 0 else 1,
         potential_payout=round(stake * (100 / price_cents), 2),
         status=BetStatus.PENDING,
-        betfair_bet_id=result.get("order_id"),  # Kalshi order ID
-        betfair_market_id=target_market["ticker"],  # Kalshi ticker
+        betfair_bet_id=result.get("order_id"),
+        betfair_market_id=target_market["ticker"],
     )
     db.add(bet)
 
-    # Update bankroll
     bankroll = get_current_bankroll(db)
     entry = BankrollEntry(
         balance=bankroll - stake,
         change_amount=-stake,
-        reason=f"Bet placed: {bet_team} to win ({analysis})",
+        reason=f"Bet: {bet_team} to win | {analysis}",
         bet_id=bet.id,
     )
     db.add(entry)
     db.commit()
 
-    if result.get("success"):
-        logger.info(
-            f"BET PLACED: {bet_team} to win | "
-            f"Ticker: {target_market['ticker']} | "
-            f"Stake: ${stake} @ {price_cents}¢ | "
-            f"EV: {prediction['expected_value']:.2%} | "
-            f"Status: {result.get('status', 'unknown')}"
-        )
-    else:
-        logger.warning(f"Bet placement failed for {event_id}: {result.get('error')}")
+    logger.info(
+        f"BET PLACED: {bet_team} to win | "
+        f"Ticker: {target_market['ticker']} @ {price_cents}¢ | "
+        f"Stake: ${stake:.2f} | EV: {prediction['expected_value']:.2%}"
+    )
+    return True
+
+
+# Common team abbreviations used in Kalshi tickers
+TEAM_ABBREVS = {
+    # NBA
+    "oklahoma city thunder": ["okc"], "utah jazz": ["uta"],
+    "sacramento kings": ["sac"], "los angeles clippers": ["lac"],
+    "golden state warriors": ["gsw", "gs"], "houston rockets": ["hou"],
+    "dallas mavericks": ["dal"], "los angeles lakers": ["lal", "la"],
+    "denver nuggets": ["den"], "portland trail blazers": ["por"],
+    "atlanta hawks": ["atl"], "new york knicks": ["nyk", "ny"],
+    "san antonio spurs": ["sas", "sa"], "philadelphia 76ers": ["phi"],
+    "minnesota timberwolves": ["min"], "charlotte hornets": ["cha"],
+    "new orleans pelicans": ["nop", "no"], "orlando magic": ["orl"],
+    "miami heat": ["mia"], "toronto raptors": ["tor"],
+    "milwaukee bucks": ["mil"], "brooklyn nets": ["bkn"],
+    "chicago bulls": ["chi"], "washington wizards": ["was"],
+    "boston celtics": ["bos"], "cleveland cavaliers": ["cle"],
+    "indiana pacers": ["ind"], "detroit pistons": ["det"],
+    "memphis grizzlies": ["mem"], "phoenix suns": ["phx"],
+    # NHL
+    "colorado avalanche": ["col"], "st louis blues": ["stl"],
+    "nashville predators": ["nsh"], "los angeles kings": ["lak"],
+    "winnipeg jets": ["wpg", "win"], "seattle kraken": ["sea"],
+    "new york rangers": ["nyr"], "washington capitals": ["wsh"],
+    "buffalo sabres": ["buf"], "tampa bay lightning": ["tb", "tbl"],
+    "san jose sharks": ["sj", "sjs"], "chicago blackhawks": ["chi"],
+    "montréal canadiens": ["mtl"], "new jersey devils": ["nj", "njd"],
+    "edmonton oilers": ["edm"], "anaheim ducks": ["ana"],
+    # MLB
+    "detroit tigers": ["det"], "minnesota twins": ["min"],
+    "miami marlins": ["mia"], "cincinnati reds": ["cin"],
+    "boston red sox": ["bos"], "milwaukee brewers": ["mil"],
+    "pittsburgh pirates": ["pit"], "san diego padres": ["sd"],
+    "cleveland guardians": ["cle"], "kansas city royals": ["kc"],
+    "texas rangers": ["tex"], "seattle mariners": ["sea"],
+    "san francisco giants": ["sf"], "philadelphia phillies": ["phi"],
+    "toronto blue jays": ["tor"], "los angeles dodgers": ["lad", "la"],
+    "colorado rockies": ["col"], "houston astros": ["hou"],
+    "los angeles angels": ["laa"], "atlanta braves": ["atl"],
+    "chicago white sox": ["cws"], "baltimore orioles": ["bal"],
+    "washington nationals": ["wsh", "was"],
+    "st. louis cardinals": ["stl"], "new york mets": ["nym"],
+    "new york yankees": ["nyy"], "arizona diamondbacks": ["ari"],
+    "tampa bay rays": ["tb"], "oakland athletics": ["oak"],
+}
+
+
+def _team_matches_ticker(team_name: str, ticker_suffix: str) -> bool:
+    """Check if a team name matches a Kalshi ticker suffix."""
+    team_lower = team_name.lower()
+    ticker_lower = ticker_suffix.lower()
+
+    # Direct lookup
+    abbrevs = TEAM_ABBREVS.get(team_lower, [])
+    if ticker_lower in abbrevs:
+        return True
+
+    # Check if ticker suffix appears in team name
+    # e.g., "sac" in "sacramento kings"
+    for word in team_lower.split():
+        if ticker_lower and word.startswith(ticker_lower):
+            return True
+
+    return False
 
 
 async def _settle_bets(db: Session):
@@ -249,7 +336,7 @@ async def _settle_bets(db: Session):
         entry = BankrollEntry(
             balance=bankroll + revenue,
             change_amount=revenue,
-            reason=f"Bet settled: {'WON' if profit > 0 else 'LOST'} ${abs(profit):.2f}",
+            reason=f"Settled: {'WON' if profit > 0 else 'LOST'} ${abs(profit):.2f} on {ticker}",
             bet_id=bet.id,
         )
         db.add(entry)
