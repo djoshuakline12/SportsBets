@@ -1,0 +1,26 @@
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    database_url: str = "postgresql://user:password@localhost:5432/sportsbets"
+    the_odds_api_key: str = ""
+    weather_api_key: str = ""
+    betfair_username: str = ""
+    betfair_password: str = ""
+    betfair_app_key: str = ""
+    betfair_certs_path: str = "./certs"
+    max_bet_amount: float = 10.00
+    kelly_fraction: float = 0.25
+    min_ev_threshold: float = 0.02
+    odds_refresh_minutes: int = 15
+    supported_sports: list[str] = [
+        "americanfootball_nfl",
+        "basketball_nba",
+        "baseball_mlb",
+        "icehockey_nhl",
+    ]
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+
+settings = Settings()
