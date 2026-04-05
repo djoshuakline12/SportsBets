@@ -173,17 +173,39 @@ async def get_kalshi_markets(sport: str | None = None):
 
 @router.get("/kalshi/debug")
 async def kalshi_debug():
-    """Debug Kalshi config — check if credentials are loaded."""
+    """Debug Kalshi config and test auth."""
     from config import settings
     has_key_id = bool(settings.kalshi_api_key_id)
     has_pem = bool(settings.kalshi_private_key_pem)
     pem_len = len(settings.kalshi_private_key_pem) if has_pem else 0
     pem_starts = settings.kalshi_private_key_pem[:30] if has_pem else ""
+
+    # Test if we can load the private key
+    key_loadable = False
+    key_error = None
+    try:
+        kalshi_service._load_private_key()
+        key_loadable = True
+    except Exception as e:
+        key_error = str(e)
+
+    # Test actual API call
+    api_result = None
+    try:
+        balance = await kalshi_service.get_account_balance()
+        api_result = balance
+    except Exception as e:
+        api_result = {"error": str(e)}
+
     return {
         "kalshi_api_key_id_set": has_key_id,
+        "kalshi_api_key_id_value": settings.kalshi_api_key_id[:8] + "..." if has_key_id else "",
         "kalshi_private_key_pem_set": has_pem,
         "kalshi_private_key_pem_length": pem_len,
         "kalshi_private_key_pem_starts_with": pem_starts,
+        "private_key_loadable": key_loadable,
+        "private_key_error": key_error,
+        "api_test_result": api_result,
     }
 
 
