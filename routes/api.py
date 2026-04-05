@@ -171,6 +171,22 @@ async def get_kalshi_markets(sport: str | None = None):
     return {"count": len(all_markets), "markets": all_markets}
 
 
+@router.get("/kalshi/debug")
+async def kalshi_debug():
+    """Debug Kalshi config — check if credentials are loaded."""
+    from config import settings
+    has_key_id = bool(settings.kalshi_api_key_id)
+    has_pem = bool(settings.kalshi_private_key_pem)
+    pem_len = len(settings.kalshi_private_key_pem) if has_pem else 0
+    pem_starts = settings.kalshi_private_key_pem[:30] if has_pem else ""
+    return {
+        "kalshi_api_key_id_set": has_key_id,
+        "kalshi_private_key_pem_set": has_pem,
+        "kalshi_private_key_pem_length": pem_len,
+        "kalshi_private_key_pem_starts_with": pem_starts,
+    }
+
+
 @router.get("/kalshi/balance")
 async def get_kalshi_balance():
     """Get Kalshi account balance."""

@@ -40,8 +40,11 @@ SPORT_MAP = {
 def _load_private_key():
     """Load RSA private key from env var (preferred) or PEM file (fallback)."""
     # Option 1: PEM content directly in env var (for Railway/cloud deploys)
-    if settings.kalshi_private_key_pem:
-        pem_data = settings.kalshi_private_key_pem.encode()
+    pem_content = settings.kalshi_private_key_pem
+    if pem_content:
+        # Railway may escape newlines as literal \n — convert them back
+        pem_content = pem_content.replace("\\n", "\n")
+        pem_data = pem_content.encode()
         return serialization.load_pem_private_key(pem_data, password=None)
 
     # Option 2: PEM file on disk (for local dev)
