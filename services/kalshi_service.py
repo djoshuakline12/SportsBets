@@ -137,31 +137,16 @@ async def get_account_balance() -> dict:
     """Get Kalshi account balance."""
     try:
         data = await _request("GET", "/portfolio/balance")
-        # Kalshi may return balance as cents directly or nested
-        # Handle both formats
-        if isinstance(data, dict):
-            # Try nested format first
-            if "balance" in data and isinstance(data["balance"], dict):
-                balance = data["balance"]
-                return {
-                    "available": balance.get("available_balance_cents", 0) / 100,
-                    "portfolio_value": balance.get("portfolio_value_cents", 0) / 100,
-                    "total": balance.get("total_value_cents", 0) / 100,
-                }
-            # Flat format — values directly in response
-            return {
-                "available": data.get("available_balance", data.get("available_balance_cents", 0)) / 100
-                    if isinstance(data.get("available_balance", data.get("available_balance_cents", 0)), (int, float))
-                    else 0,
-                "portfolio_value": data.get("portfolio_value", data.get("portfolio_value_cents", 0)) / 100
-                    if isinstance(data.get("portfolio_value", data.get("portfolio_value_cents", 0)), (int, float))
-                    else 0,
-                "raw": data,  # include raw response so we can see the actual format
-            }
-        return {"available": 0, "raw": data}
+        # Kalshi returns: {"balance": 500, "portfolio_value": 0, ...}
+        # Values are in cents
+        return {
+            "available": data.get("balance", 0) / 100,
+            "portfolio_value": data.get("portfolio_value", 0) / 100,
+            "total": (data.get("balance", 0) + data.get("portfolio_value", 0)) / 100,
+        }
     except Exception as e:
         logger.error(f"Failed to get Kalshi balance: {e}")
-        return {"available": 0, "error": str(e)}
+        return {"available": 0, "portfolio_value": 0, "total": 0, "error": str(e)}
 
 
 async def search_sports_markets(
