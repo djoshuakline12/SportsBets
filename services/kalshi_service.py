@@ -28,12 +28,12 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
-# Maps The Odds API sport keys to Kalshi sport categories
+# Maps The Odds API sport keys to Kalshi series tickers for individual games
 SPORT_MAP = {
-    "americanfootball_nfl": "pro-football",
-    "basketball_nba": "pro-basketball",
-    "baseball_mlb": "baseball",
-    "icehockey_nhl": "hockey",
+    "americanfootball_nfl": "KXNFLGAME",
+    "basketball_nba": "KXNBAGAME",
+    "baseball_mlb": "KXMLBGAME",
+    "icehockey_nhl": "KXNHLGAME",
 }
 
 
