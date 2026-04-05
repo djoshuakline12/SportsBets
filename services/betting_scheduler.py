@@ -4,7 +4,7 @@ Runs on a configurable interval to:
 1. Refresh odds data
 2. Update Elo ratings from recent results
 3. Generate predictions
-4. Place bets on positive EV opportunities via Kalshi
+4. Place limit orders on Kalshi for positive EV opportunities
 5. Settle completed bets and update bankroll
 """
 
@@ -96,9 +96,15 @@ async def _update_elo_ratings(db: Session):
 
 
 async def _place_bet(db: Session, prediction: dict):
-    """Attempt to place a bet via Kalshi."""
+    """Place a limit order on Kalshi.
+
+    On Kalshi, each team has its own ticker. We buy "yes" on the team
+    we think will win, at a price equal to our estimated probability.
+    This posts a limit order — if nobody takes the other side, it sits
+    on the book until the market closes or someone fills it.
+    """
     event_id = prediction["event_id"]
-    side = prediction["recommended_side"]
+    side = prediction["recommended_side"]  # "home" or "away"
     stake = prediction["stake"]
 
     # Check if we already have an active bet on this event
@@ -111,34 +117,65 @@ async def _place_bet(db: Session, prediction: dict):
         logger.info(f"Already have pending bet on {event_id}, skipping")
         return
 
-    # Find Kalshi market
+    # Find ALL Kalshi markets for this game (one per team)
     commence = datetime.fromisoformat(prediction["commence_time"])
-    market = await kalshi_service.find_market(
+    markets = await kalshi_service.search_sports_markets(
         prediction["sport"],
         prediction["home_team"],
         prediction["away_team"],
-        commence,
     )
 
-    if not market:
+    if not markets:
         logger.info(f"No Kalshi market found for {event_id}")
         return
 
-    # On Kalshi, "yes" = team wins, "no" = team loses
-    # If we predict home wins and the market is about the home team, buy "yes"
-    # We need to determine the market's subject to pick the right side
-    kalshi_side = "yes" if side == "home" else "no"
+    # Find the right ticker for the team we're betting on
+    # Kalshi tickers end with team abbreviation (e.g., -OKC, -UTA)
+    bet_team = prediction["home_team"] if side == "home" else prediction["away_team"]
+    target_market = None
 
-    # Convert our model's probability to a price in cents
+    for m in markets:
+        title = (m.get("title") or "").lower()
+        ticker = (m.get("ticker") or "").lower()
+        # Each team gets its own ticker — find the one for our team
+        if kalshi_service._fuzzy_match(bet_team.lower(), f"{title} {ticker}"):
+            target_market = m
+            break
+
+    if not target_market:
+        # Fallback: use first market and buy "yes"
+        target_market = markets[0]
+        logger.info(f"Using first market as fallback: {target_market['ticker']}")
+
+    # Set limit price based on our model's probability
+    # We buy "yes" at a price that gives us +EV
+    # Our probability for this team winning = prediction's win_probability
     win_prob = prediction["win_probability"]
-    price_cents = max(1, min(99, int(win_prob * 100)))
+    # Post at slightly below our estimated probability for better value
+    price_cents = max(1, min(99, int(win_prob * 100) - 2))
 
-    # Place bet
+    # Always buy "yes" on the team's specific ticker
+    kalshi_side = "yes"
+
+    # Place limit order
     result = await kalshi_service.place_bet(
-        ticker=market["ticker"],
+        ticker=target_market["ticker"],
         side=kalshi_side,
         stake_dollars=stake,
         price_cents=price_cents,
+    )
+
+    # Build analysis string for why we placed this bet
+    factors = prediction.get("factors", {})
+    analysis = (
+        f"Model edge: {prediction['expected_value']:.1%} EV | "
+        f"Elo: {factors.get('home_elo', 1500):.0f} vs {factors.get('away_elo', 1500):.0f} | "
+        f"Model prob: {win_prob:.1%} | "
+        f"Market consensus: {factors.get('market_home_prob', 0.5):.1%} | "
+        f"Blended: {factors.get('blended_home_prob', 0.5):.1%} | "
+        f"Books: {factors.get('num_bookmakers', 0)} | "
+        f"Kalshi ticker: {target_market['ticker']} | "
+        f"Limit price: ${price_cents}¢"
     )
 
     # Record bet in database
@@ -151,10 +188,10 @@ async def _place_bet(db: Session, prediction: dict):
         side=side,
         stake=stake,
         odds=prediction["best_odds"],
-        potential_payout=round(stake * prediction["best_odds"], 2),
+        potential_payout=round(stake * (100 / price_cents), 2),
         status=BetStatus.PENDING,
-        betfair_bet_id=result.get("order_id"),  # reusing column for Kalshi order ID
-        betfair_market_id=market["ticker"],  # reusing column for Kalshi ticker
+        betfair_bet_id=result.get("order_id"),  # Kalshi order ID
+        betfair_market_id=target_market["ticker"],  # Kalshi ticker
     )
     db.add(bet)
 
@@ -163,7 +200,7 @@ async def _place_bet(db: Session, prediction: dict):
     entry = BankrollEntry(
         balance=bankroll - stake,
         change_amount=-stake,
-        reason=f"Bet placed: {prediction['home_team']} vs {prediction['away_team']} ({side})",
+        reason=f"Bet placed: {bet_team} to win ({analysis})",
         bet_id=bet.id,
     )
     db.add(entry)
@@ -171,8 +208,11 @@ async def _place_bet(db: Session, prediction: dict):
 
     if result.get("success"):
         logger.info(
-            f"BET PLACED: {side} on {prediction['home_team']} vs {prediction['away_team']} "
-            f"| Stake: ${stake} | Ticker: {market['ticker']} | EV: {prediction['expected_value']:.2%}"
+            f"BET PLACED: {bet_team} to win | "
+            f"Ticker: {target_market['ticker']} | "
+            f"Stake: ${stake} @ {price_cents}¢ | "
+            f"EV: {prediction['expected_value']:.2%} | "
+            f"Status: {result.get('status', 'unknown')}"
         )
     else:
         logger.warning(f"Bet placement failed for {event_id}: {result.get('error')}")
@@ -188,11 +228,10 @@ async def _settle_bets(db: Session):
 
     for s in settlements:
         ticker = s.get("ticker")
-        # Find pending bets matching this ticker
         bet = (
             db.query(Bet)
             .filter(
-                Bet.betfair_market_id == ticker,  # ticker stored here
+                Bet.betfair_market_id == ticker,
                 Bet.status == BetStatus.PENDING,
             )
             .first()
@@ -206,7 +245,6 @@ async def _settle_bets(db: Session):
         bet.status = BetStatus.WON if profit > 0 else BetStatus.LOST
         bet.settled_at = datetime.utcnow()
 
-        # Update bankroll
         bankroll = get_current_bankroll(db)
         entry = BankrollEntry(
             balance=bankroll + revenue,
