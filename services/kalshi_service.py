@@ -38,15 +38,23 @@ SPORT_MAP = {
 
 
 def _load_private_key():
-    """Load RSA private key from PEM file."""
+    """Load RSA private key from env var (preferred) or PEM file (fallback)."""
+    # Option 1: PEM content directly in env var (for Railway/cloud deploys)
+    if settings.kalshi_private_key_pem:
+        pem_data = settings.kalshi_private_key_pem.encode()
+        return serialization.load_pem_private_key(pem_data, password=None)
+
+    # Option 2: PEM file on disk (for local dev)
     key_path = Path(settings.kalshi_private_key_path)
-    if not key_path.exists():
-        raise FileNotFoundError(
-            f"Kalshi private key not found at {key_path}. "
-            "Generate one at kalshi.com → Settings → API Keys."
-        )
-    pem_data = key_path.read_bytes()
-    return serialization.load_pem_private_key(pem_data, password=None)
+    if key_path.exists():
+        pem_data = key_path.read_bytes()
+        return serialization.load_pem_private_key(pem_data, password=None)
+
+    raise FileNotFoundError(
+        "Kalshi private key not found. Set KALSHI_PRIVATE_KEY_PEM env var "
+        "with the PEM content, or place the key file at "
+        f"{settings.kalshi_private_key_path}."
+    )
 
 
 def _sign_request(method: str, path: str, timestamp_ms: int) -> str:

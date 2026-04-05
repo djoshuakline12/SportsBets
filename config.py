@@ -6,7 +6,8 @@ class Settings(BaseSettings):
     the_odds_api_key: str = ""
     weather_api_key: str = ""
     kalshi_api_key_id: str = ""
-    kalshi_private_key_path: str = "./kalshi_private_key.pem"
+    kalshi_private_key_pem: str = ""  # PEM content as env var (for Railway)
+    kalshi_private_key_path: str = "./kalshi_private_key.pem"  # fallback file path
     max_bet_amount: float = 1.00
     kelly_fraction: float = 0.25
     min_ev_threshold: float = 0.02
