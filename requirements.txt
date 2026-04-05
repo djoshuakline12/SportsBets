@@ -9,4 +9,4 @@ apscheduler==3.10.4
 python-dotenv==1.0.1
 pydantic==2.10.3
 pydantic-settings==2.7.0
-betfairlightweight==2.20.2
+cryptography==44.0.0

@@ -53,8 +53,6 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     scheduler.shutdown()
-    from services.betfair_service import logout
-    logout()
     logger.info("Shutdown complete")
 
 

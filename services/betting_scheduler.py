@@ -4,11 +4,10 @@ Runs on a configurable interval to:
 1. Refresh odds data
 2. Update Elo ratings from recent results
 3. Generate predictions
-4. Place bets on positive EV opportunities via Betfair
+4. Place bets on positive EV opportunities via Kalshi
 5. Settle completed bets and update bankroll
 """
 
-import json
 import logging
 from datetime import datetime
 
@@ -18,7 +17,7 @@ from config import settings
 from engine.predictor import generate_predictions, get_current_bankroll
 from models.database import SessionLocal
 from models.schemas import BankrollEntry, Bet, BetStatus, UserSettings
-from services import betfair_service, odds_service, stats_service
+from services import kalshi_service, odds_service, stats_service
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +96,10 @@ async def _update_elo_ratings(db: Session):
 
 
 async def _place_bet(db: Session, prediction: dict):
-    """Attempt to place a bet via Betfair Exchange."""
+    """Attempt to place a bet via Kalshi."""
     event_id = prediction["event_id"]
     side = prediction["recommended_side"]
     stake = prediction["stake"]
-    odds = prediction["best_odds"]
 
     # Check if we already have an active bet on this event
     existing = (
@@ -113,9 +111,9 @@ async def _place_bet(db: Session, prediction: dict):
         logger.info(f"Already have pending bet on {event_id}, skipping")
         return
 
-    # Find Betfair market
+    # Find Kalshi market
     commence = datetime.fromisoformat(prediction["commence_time"])
-    market = await betfair_service.find_market(
+    market = await kalshi_service.find_market(
         prediction["sport"],
         prediction["home_team"],
         prediction["away_team"],
@@ -123,21 +121,24 @@ async def _place_bet(db: Session, prediction: dict):
     )
 
     if not market:
-        logger.info(f"No Betfair market found for {event_id}")
+        logger.info(f"No Kalshi market found for {event_id}")
         return
 
-    # Determine selection
-    if side == "home":
-        selection_id = market["home_selection_id"]
-    else:
-        selection_id = market["away_selection_id"]
+    # On Kalshi, "yes" = team wins, "no" = team loses
+    # If we predict home wins and the market is about the home team, buy "yes"
+    # We need to determine the market's subject to pick the right side
+    kalshi_side = "yes" if side == "home" else "no"
+
+    # Convert our model's probability to a price in cents
+    win_prob = prediction["win_probability"]
+    price_cents = max(1, min(99, int(win_prob * 100)))
 
     # Place bet
-    result = await betfair_service.place_bet(
-        market["market_id"],
-        selection_id,
-        stake,
-        odds,
+    result = await kalshi_service.place_bet(
+        ticker=market["ticker"],
+        side=kalshi_side,
+        stake_dollars=stake,
+        price_cents=price_cents,
     )
 
     # Record bet in database
@@ -149,11 +150,11 @@ async def _place_bet(db: Session, prediction: dict):
         away_team=prediction["away_team"],
         side=side,
         stake=stake,
-        odds=odds,
-        potential_payout=round(stake * odds, 2),
+        odds=prediction["best_odds"],
+        potential_payout=round(stake * prediction["best_odds"], 2),
         status=BetStatus.PENDING,
-        betfair_bet_id=result.get("bet_id"),
-        betfair_market_id=market["market_id"],
+        betfair_bet_id=result.get("order_id"),  # reusing column for Kalshi order ID
+        betfair_market_id=market["ticker"],  # reusing column for Kalshi ticker
     )
     db.add(bet)
 
@@ -171,40 +172,45 @@ async def _place_bet(db: Session, prediction: dict):
     if result.get("success"):
         logger.info(
             f"BET PLACED: {side} on {prediction['home_team']} vs {prediction['away_team']} "
-            f"| Stake: ${stake} | Odds: {odds} | EV: {prediction['expected_value']:.2%}"
+            f"| Stake: ${stake} | Ticker: {market['ticker']} | EV: {prediction['expected_value']:.2%}"
         )
     else:
         logger.warning(f"Bet placement failed for {event_id}: {result.get('error')}")
 
 
 async def _settle_bets(db: Session):
-    """Check Betfair for settled bets and update records."""
+    """Check Kalshi for settled positions and update records."""
     try:
-        settled = await betfair_service.get_settled_bets(hours=48)
+        settlements = await kalshi_service.get_settlements(limit=100)
     except Exception as e:
-        logger.error(f"Failed to fetch settled bets: {e}")
+        logger.error(f"Failed to fetch settlements: {e}")
         return
 
-    for s in settled:
+    for s in settlements:
+        ticker = s.get("ticker")
+        # Find pending bets matching this ticker
         bet = (
             db.query(Bet)
-            .filter(Bet.betfair_bet_id == s["bet_id"])
+            .filter(
+                Bet.betfair_market_id == ticker,  # ticker stored here
+                Bet.status == BetStatus.PENDING,
+            )
             .first()
         )
-        if not bet or bet.status != BetStatus.PENDING:
+        if not bet:
             continue
 
-        profit = s.get("profit", 0)
-        bet.profit_loss = profit
+        revenue = s.get("revenue", 0)
+        profit = revenue - bet.stake
+        bet.profit_loss = round(profit, 2)
         bet.status = BetStatus.WON if profit > 0 else BetStatus.LOST
         bet.settled_at = datetime.utcnow()
 
         # Update bankroll
         bankroll = get_current_bankroll(db)
-        payout = bet.stake + profit  # Return stake + profit (or stake - loss)
         entry = BankrollEntry(
-            balance=bankroll + payout,
-            change_amount=payout,
+            balance=bankroll + revenue,
+            change_amount=revenue,
             reason=f"Bet settled: {'WON' if profit > 0 else 'LOST'} ${abs(profit):.2f}",
             bet_id=bet.id,
         )
