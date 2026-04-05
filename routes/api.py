@@ -147,7 +147,7 @@ async def get_kalshi_markets(sport: str | None = None):
             continue
         try:
             path = f"/markets?status=open&series_ticker={kalshi_sport}&limit=100"
-            data = await kalshi_service._request("GET", path)
+            data = await kalshi_service._request("GET", path, auth=False)
             markets = data.get("markets", [])
             for m in markets:
                 all_markets.append({

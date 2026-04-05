@@ -44,6 +44,20 @@ def _load_private_key():
     if pem_content:
         # Railway may escape newlines as literal \n — convert them back
         pem_content = pem_content.replace("\\n", "\n")
+        # If newlines got stripped entirely, reconstruct the PEM format
+        if "\n" not in pem_content.strip():
+            # Extract the base64 content between header and footer
+            content = pem_content
+            content = content.replace("-----BEGIN RSA PRIVATE KEY-----", "")
+            content = content.replace("-----END RSA PRIVATE KEY-----", "")
+            content = content.replace(" ", "")
+            # Re-wrap at 64 chars per line (PEM standard)
+            lines = [content[i : i + 64] for i in range(0, len(content), 64)]
+            pem_content = (
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                + "\n".join(lines)
+                + "\n-----END RSA PRIVATE KEY-----\n"
+            )
         pem_data = pem_content.encode()
         return serialization.load_pem_private_key(pem_data, password=None)
 
@@ -90,10 +104,15 @@ def _auth_headers(method: str, path: str) -> dict:
     }
 
 
-async def _request(method: str, path: str, body: dict | None = None) -> dict:
-    """Make an authenticated request to the Kalshi API."""
+async def _request(
+    method: str, path: str, body: dict | None = None, auth: bool = True
+) -> dict:
+    """Make a request to the Kalshi API. Public endpoints can skip auth."""
     url = f"{BASE_URL}{path}"
-    headers = _auth_headers(method.upper(), path)
+    if auth:
+        headers = _auth_headers(method.upper(), path)
+    else:
+        headers = {"Content-Type": "application/json"}
 
     async with httpx.AsyncClient(timeout=15) as client:
         if method.upper() == "GET":
@@ -137,12 +156,10 @@ async def search_sports_markets(
     if not kalshi_sport:
         return []
 
-    # Search by team names
-    search_term = f"{home_team} {away_team}"
     path = f"/markets?status=open&series_ticker={kalshi_sport}"
 
     try:
-        data = await _request("GET", path)
+        data = await _request("GET", path, auth=False)
         markets = data.get("markets", [])
 
         # Filter for markets matching our teams
