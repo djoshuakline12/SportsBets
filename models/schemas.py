@@ -118,8 +118,8 @@ class UserSettings(Base):
     __tablename__ = "user_settings"
 
     id = Column(Integer, primary_key=True)
-    initial_bankroll = Column(Float, default=1000.0)
-    max_bet_amount = Column(Float, default=10.0)
+    initial_bankroll = Column(Float, default=5.0)
+    max_bet_amount = Column(Float, default=1.0)
     kelly_fraction = Column(Float, default=0.25)
     min_ev_threshold = Column(Float, default=0.02)
     active_sports = Column(Text)  # JSON list

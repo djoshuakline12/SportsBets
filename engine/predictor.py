@@ -38,7 +38,7 @@ def get_current_bankroll(db: Session) -> float:
         .order_by(BankrollEntry.recorded_at.desc())
         .first()
     )
-    return entry.balance if entry else 1000.0
+    return entry.balance if entry else 5.0
 
 
 def generate_predictions(

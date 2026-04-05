@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     weather_api_key: str = ""
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = "./kalshi_private_key.pem"
-    max_bet_amount: float = 10.00
+    max_bet_amount: float = 1.00
     kelly_fraction: float = 0.25
     min_ev_threshold: float = 0.02
     odds_refresh_minutes: int = 15
