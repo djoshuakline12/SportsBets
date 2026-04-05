@@ -259,7 +259,7 @@ def get_bankroll(db: Session = Depends(get_db)):
 
 
 @router.get("/dashboard")
-def get_dashboard(db: Session = Depends(get_db)):
+async def get_dashboard(db: Session = Depends(get_db)):
     """Aggregated dashboard stats."""
     bankroll = get_current_bankroll(db)
 
@@ -284,8 +284,12 @@ def get_dashboard(db: Session = Depends(get_db)):
         .all()
     )
 
+    # Kalshi account balance
+    kalshi_balance = await kalshi_service.get_account_balance()
+
     return {
         "bankroll": bankroll,
+        "kalshi_balance": kalshi_balance,
         "total_bets": total_bets,
         "won": won,
         "lost": lost,

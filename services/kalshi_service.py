@@ -77,15 +77,18 @@ def _load_private_key():
 def _sign_request(method: str, path: str, timestamp_ms: int) -> str:
     """Create RSA-PSS signature for Kalshi API authentication.
 
-    Signature message format: timestamp + method + path
+    Signature message format: timestamp + method + path (without query params)
+    Uses RSA-PSS with SHA256 and DIGEST_LENGTH salt.
     """
     private_key = _load_private_key()
-    message = f"{timestamp_ms}{method}{path}".encode()
+    # Strip query parameters from path before signing
+    sign_path = path.split("?")[0]
+    message = f"{timestamp_ms}{method}{sign_path}".encode()
     signature = private_key.sign(
         message,
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
+            salt_length=hashes.SHA256.digest_size,  # 32 bytes, not MAX_LENGTH
         ),
         hashes.SHA256(),
     )
