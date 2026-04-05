@@ -21,8 +21,6 @@ from services import kalshi_service, odds_service, stats_service
 
 logger = logging.getLogger(__name__)
 
-# Max bets per cycle to avoid overexposure
-MAX_BETS_PER_CYCLE = 3
 
 
 async def run_betting_cycle():
@@ -52,13 +50,9 @@ async def run_betting_cycle():
         bettable.sort(key=lambda p: p["confidence"], reverse=True)
         logger.info(f"Found {len(bettable)} bettable predictions (EV >= {min_ev})")
 
-        # 5. Place bets — only the top N, and stop if bankroll runs out
+        # 5. Place bets — all +EV bets, stop only if bankroll runs out
         bets_placed = 0
         for pred in bettable:
-            if bets_placed >= MAX_BETS_PER_CYCLE:
-                logger.info(f"Hit max bets per cycle ({MAX_BETS_PER_CYCLE}), stopping")
-                break
-
             # Check remaining Kalshi balance before each bet
             try:
                 balance = await kalshi_service.get_account_balance()
