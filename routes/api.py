@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from engine.predictor import generate_predictions, get_current_bankroll
 from models.database import get_db
 from models.schemas import BankrollEntry, Bet, BetStatus, Prediction, UserSettings
-from services.odds_service import get_latest_odds
+from services.odds_service import fetch_all_odds, get_latest_odds, store_odds
 
 router = APIRouter(prefix="/api")
 
@@ -64,9 +64,21 @@ def get_predictions(sport: str | None = None, db: Session = Depends(get_db)):
 
 @router.get("/predictions/refresh")
 async def refresh_predictions(db: Session = Depends(get_db)):
-    """Trigger a fresh prediction run."""
+    """Fetch fresh odds, then generate predictions."""
+    # 1. Fetch odds from The Odds API
+    try:
+        events = await fetch_all_odds()
+        odds_count = store_odds(db, events)
+    except Exception as e:
+        return {"error": f"Odds fetch failed: {str(e)}", "count": 0, "predictions": []}
+
+    # 2. Generate predictions from stored odds
     predictions = generate_predictions(db)
-    return {"count": len(predictions), "predictions": predictions}
+    return {
+        "odds_fetched": odds_count,
+        "count": len(predictions),
+        "predictions": predictions,
+    }
 
 
 @router.get("/odds")
