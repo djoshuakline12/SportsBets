@@ -9,6 +9,7 @@ from engine.predictor import generate_predictions, get_current_bankroll
 from models.database import get_db
 from models.schemas import BankrollEntry, Bet, BetStatus, Prediction, UserSettings
 from services.odds_service import fetch_all_odds, get_latest_odds, store_odds
+from services import kalshi_service
 
 router = APIRouter(prefix="/api")
 
@@ -29,8 +30,8 @@ class SettingsUpdate(BaseModel):
 
 
 @router.get("/predictions")
-def get_predictions(sport: str | None = None, db: Session = Depends(get_db)):
-    """Get current predictions for upcoming events."""
+async def get_predictions(sport: str | None = None, db: Session = Depends(get_db)):
+    """Get current predictions with Kalshi market availability."""
     query = db.query(Prediction).filter(
         Prediction.commence_time > datetime.now(timezone.utc)
     )
@@ -39,8 +40,9 @@ def get_predictions(sport: str | None = None, db: Session = Depends(get_db)):
 
     preds = query.order_by(Prediction.expected_value.desc()).limit(50).all()
 
-    return [
-        {
+    results = []
+    for p in preds:
+        pred_data = {
             "id": p.id,
             "event_id": p.event_id,
             "sport": p.sport,
@@ -57,9 +59,22 @@ def get_predictions(sport: str | None = None, db: Session = Depends(get_db)):
             "kelly_fraction": p.kelly_fraction,
             "factors": json.loads(p.factors) if p.factors else {},
             "created_at": p.created_at.isoformat() if p.created_at else None,
+            "kalshi_market": None,
         }
-        for p in preds
-    ]
+
+        # Try to find matching Kalshi market
+        try:
+            market = await kalshi_service.find_market(
+                p.sport, p.home_team, p.away_team, p.commence_time
+            )
+            if market:
+                pred_data["kalshi_market"] = market
+        except Exception:
+            pass
+
+        results.append(pred_data)
+
+    return results
 
 
 @router.get("/predictions/refresh")
@@ -82,9 +97,90 @@ async def refresh_predictions(db: Session = Depends(get_db)):
 
 
 @router.get("/odds")
-def get_odds(sport: str | None = None, db: Session = Depends(get_db)):
-    """Get latest odds comparison across bookmakers."""
-    return get_latest_odds(db, sport)
+async def get_odds(sport: str | None = None, db: Session = Depends(get_db)):
+    """Get latest odds comparison across bookmakers, including Kalshi."""
+    events = get_latest_odds(db, sport)
+
+    # Enrich each event with Kalshi odds if available
+    for event in events:
+        try:
+            kalshi_markets = await kalshi_service.search_sports_markets(
+                event.get("sport", ""),
+                event.get("home_team", ""),
+                event.get("away_team", ""),
+            )
+            if kalshi_markets:
+                best = max(kalshi_markets, key=lambda m: m.get("volume", 0))
+                event["kalshi"] = {
+                    "ticker": best["ticker"],
+                    "title": best["title"],
+                    "yes_price": best["yes_price"],
+                    "no_price": best["no_price"],
+                    "volume": best["volume"],
+                    "close_time": best["close_time"],
+                }
+                # Also add Kalshi as a bookmaker in the odds comparison
+                # yes_price maps to home team win probability/price
+                if best["yes_price"] > 0:
+                    event["bookmakers"]["kalshi"] = {
+                        "home_price": round(1 / best["yes_price"], 2) if best["yes_price"] > 0 else None,
+                        "away_price": round(1 / best["no_price"], 2) if best["no_price"] > 0 else None,
+                        "draw_price": None,
+                    }
+        except Exception:
+            pass
+
+    return events
+
+
+@router.get("/kalshi/markets")
+async def get_kalshi_markets(sport: str | None = None):
+    """Get all open Kalshi sports markets directly."""
+    from config import settings
+
+    sports = [sport] if sport else settings.supported_sports
+    all_markets = []
+
+    for s in sports:
+        kalshi_sport = kalshi_service.SPORT_MAP.get(s, "")
+        if not kalshi_sport:
+            continue
+        try:
+            path = f"/markets?status=open&series_ticker={kalshi_sport}&limit=100"
+            data = await kalshi_service._request("GET", path)
+            markets = data.get("markets", [])
+            for m in markets:
+                all_markets.append({
+                    "ticker": m.get("ticker"),
+                    "title": m.get("title"),
+                    "subtitle": m.get("subtitle"),
+                    "event_ticker": m.get("event_ticker"),
+                    "sport": s,
+                    "yes_price": m.get("yes_price_cents", 0) / 100,
+                    "no_price": m.get("no_price_cents", 0) / 100,
+                    "yes_price_cents": m.get("yes_price_cents"),
+                    "no_price_cents": m.get("no_price_cents"),
+                    "volume": m.get("volume", 0),
+                    "open_interest": m.get("open_interest", 0),
+                    "close_time": m.get("close_time"),
+                    "status": m.get("status"),
+                })
+        except Exception as e:
+            all_markets.append({"sport": s, "error": str(e)})
+
+    return {"count": len(all_markets), "markets": all_markets}
+
+
+@router.get("/kalshi/balance")
+async def get_kalshi_balance():
+    """Get Kalshi account balance."""
+    return await kalshi_service.get_account_balance()
+
+
+@router.get("/kalshi/positions")
+async def get_kalshi_positions():
+    """Get open Kalshi positions."""
+    return await kalshi_service.get_positions()
 
 
 @router.get("/bets")
@@ -112,7 +208,8 @@ def get_bets(
             "potential_payout": b.potential_payout,
             "status": b.status.value if b.status else None,
             "profit_loss": b.profit_loss,
-            "betfair_bet_id": b.betfair_bet_id,
+            "kalshi_order_id": b.betfair_bet_id,
+            "kalshi_ticker": b.betfair_market_id,
             "placed_at": b.placed_at.isoformat() if b.placed_at else None,
             "settled_at": b.settled_at.isoformat() if b.settled_at else None,
         }
