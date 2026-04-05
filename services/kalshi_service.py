@@ -98,7 +98,9 @@ def _sign_request(method: str, path: str, timestamp_ms: int) -> str:
 def _auth_headers(method: str, path: str) -> dict:
     """Generate authentication headers for a Kalshi API request."""
     timestamp_ms = int(time.time() * 1000)
-    signature = _sign_request(method.upper(), path, timestamp_ms)
+    # Kalshi requires the full path including /trade-api/v2 prefix for signing
+    full_path = f"/trade-api/v2{path}"
+    signature = _sign_request(method.upper(), full_path, timestamp_ms)
     return {
         "KALSHI-ACCESS-KEY": settings.kalshi_api_key_id,
         "KALSHI-ACCESS-SIGNATURE": signature,
